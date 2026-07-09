@@ -642,7 +642,7 @@ void aggregate_features(const float* sas_x, const float* sas_y, const float* sas
         // cavity is almost fully enclosed by protein (high density). Feeding this ratio
         // to XGBoost teaches it to favor physically enclosed, buried pockets over flat
         // surfaces.
-        float sphere_volume = (4.0f / 3.0f) * 3.14159265358979f * cutoff * cutoff * cutoff;
+        float sphere_volume = (4.0f / 3.0f) * 3.14159265358979f * cutoff * cutoff * cutoff;  // (4/3)*pi*r^3
         out_density[idx] = c_count / sphere_volume;
     }
 }
@@ -1004,6 +1004,7 @@ pockets = []
 # A true cavity is compact: it packs many surface points into a small enclosed
 # volume. Sprawling, shallow clusters spread few points over a huge convex hull,
 # giving a very low point density. We reject those below this cutoff (points/A^3).
+# The 0.01 default is an empirical starting point; tune it per protein/probe size.
 MIN_POINT_DENSITY = 0.01  # surface points per cubic Angstrom
 rejected_sprawling = 0
 
@@ -1021,7 +1022,7 @@ for label in unique_labels:
     total_score = cp.sum(pocket_scores).item()
     points_count = int(cp.sum(pocket_mask))
 
-    # --- True cavity volume via Convex Hull (Voxel Inversion) ---
+    # --- True cavity volume via Convex Hull ---
     # Pull the cluster's XYZ coordinates back to the CPU and wrap them in a convex
     # hull. ConvexHull(...).volume returns the enclosed geometric volume of the
     # pocket in cubic Angstroms. A ConvexHull needs at least 4 non-coplanar points;
