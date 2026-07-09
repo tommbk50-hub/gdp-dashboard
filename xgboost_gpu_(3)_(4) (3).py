@@ -533,6 +533,7 @@ f_aromatic = cp.zeros(NUM_SAS_POINTS, dtype=cp.float32)    # aromatic density
 f_pos_ion = cp.zeros(NUM_SAS_POINTS, dtype=cp.float32)     # positive ionizable density
 f_neg_ion = cp.zeros(NUM_SAS_POINTS, dtype=cp.float32)     # negative ionizable density
 f_zn_binder = cp.zeros(NUM_SAS_POINTS, dtype=cp.float32)   # zinc-binder density
+f_density = cp.zeros(NUM_SAS_POINTS, dtype=cp.float32)     # buriedness (atoms per cubic Angstrom)
 
 # Compile the Enriched Feature Aggregation Kernel with native pharmacophore logic.
 aggregation_source = r'''
@@ -549,6 +550,7 @@ void aggregate_features(const float* sas_x, const float* sas_y, const float* sas
                         float* out_acceptor, float* out_donor,
                         float* out_hydrophobe, float* out_aromatic,
                         float* out_pos_ion, float* out_neg_ion, float* out_zn_binder,
+                        float* out_density,
                         float cell_size, float cutoff, float steric_cutoff,
                         int grid_dim_x, int grid_dim_y, int grid_dim_z, int num_sas) {
 
@@ -626,11 +628,22 @@ void aggregate_features(const float* sas_x, const float* sas_y, const float* sas
         out_acceptor[idx] = 0.0f; out_donor[idx] = 0.0f;
         out_hydrophobe[idx] = 0.0f; out_aromatic[idx] = 0.0f;
         out_pos_ion[idx] = 0.0f; out_neg_ion[idx] = 0.0f; out_zn_binder[idx] = 0.0f;
+        out_density[idx] = 0.0f;
     } else {
         out_counts[idx] = c_count; out_electro[idx] = c_electro;
         out_acceptor[idx] = c_acceptor; out_donor[idx] = c_donor;
         out_hydrophobe[idx] = c_hydrophobe; out_aromatic[idx] = c_aromatic;
         out_pos_ion[idx] = c_pos_ion; out_neg_ion[idx] = c_neg_ion; out_zn_binder[idx] = c_zn_binder;
+
+        // --- Buriedness / Solid Angle proxy ---
+        // Convert the raw neighbor atom count into a local density (atoms per cubic
+        // Angstrom) inside the 4.0 A probe sphere. A point on a flat surface only sees
+        // protein in ~half the sphere (low density), whereas a point deep inside a
+        // cavity is almost fully enclosed by protein (high density). Feeding this ratio
+        // to XGBoost teaches it to favor physically enclosed, buried pockets over flat
+        // surfaces.
+        float sphere_volume = (4.0f / 3.0f) * 3.14159265358979f * cutoff * cutoff * cutoff;  // (4/3)*pi*r^3
+        out_density[idx] = c_count / sphere_volume;
     }
 }
 '''
@@ -651,6 +664,7 @@ aggregate_kernel((sas_blocks,), (threads_per_block,),
                   cell_starts_gpu, cell_ends_gpu,
                   f_counts, f_electro, f_acceptor, f_donor, f_hydrophobe, f_aromatic,
                   f_pos_ion, f_neg_ion, f_zn_binder,
+                  f_density,
                   np.float32(CELL_SIZE), np.float32(CUTOFF_RADIUS), np.float32(STERIC_CUTOFF),
                   GRID_DIM_X, GRID_DIM_Y, GRID_DIM_Z, NUM_SAS_POINTS))
 
@@ -680,6 +694,7 @@ if len(valid_points) > 0:
     print(f"  * Local Positive Ionizable Density: {f_pos_ion[sample_idx].item():.4f}")
     print(f"  * Local Negative Ionizable Density: {f_neg_ion[sample_idx].item():.4f}")
     print(f"  * Local Zinc-Binder Density: {f_zn_binder[sample_idx].item():.4f}")
+    print(f"  * Local Buriedness (atoms/A^3 in 4A sphere): {f_density[sample_idx].item():.4f}")
 
 """To visualize the impact of moving from random noise to true AMBER electrostatics, you should make two primary adjustments to your py3Dmol visualization cell:
 
@@ -829,7 +844,8 @@ X_gpu = cp.column_stack((
     f_aromatic,    # aromatic pharmacophore density
     f_pos_ion,     # positive ionizable pharmacophore density
     f_neg_ion,     # negative ionizable pharmacophore density
-    f_zn_binder    # zinc-binder pharmacophore density
+    f_zn_binder,   # zinc-binder pharmacophore density
+    f_density      # buriedness: local atom density (atoms per cubic Angstrom)
 ))
 
 # Filter to only the valid SAS points (those intersecting the protein)
@@ -915,6 +931,13 @@ This code performs pocket segmentation and clustering to identify distinct ligan
 import cupy as cp
 import numpy as np
 from cuml.cluster import DBSCAN
+from scipy.spatial import ConvexHull
+try:
+    # Public location (scipy >= 1.8)
+    from scipy.spatial import QhullError
+except ImportError:
+    # Fallback for older scipy releases
+    from scipy.spatial.qhull import QhullError
 import time
 
 print("Executing Step 4: Pocket Segmentation and Spatial Clustering...")
@@ -972,11 +995,18 @@ end_cluster = time.time()
 print(f"  -> DBSCAN segmentation completed on GPU in {(end_cluster - start_cluster)*1000:.2f} ms")
 
 # ==========================================
-# 4. Pocket Compilation and Ranking
+# 4. Pocket Compilation, Volume Estimation, and Ranking
 # ==========================================
 # Labels of -1 indicate background noise points rejected by DBSCAN
 unique_labels = cp.unique(cluster_labels_gpu)
 pockets = []
+
+# A true cavity is compact: it packs many surface points into a small enclosed
+# volume. Sprawling, shallow clusters spread few points over a huge convex hull,
+# giving a very low point density. We reject those below this cutoff (points/A^3).
+# The 0.01 default is an empirical starting point; tune it per protein/probe size.
+MIN_POINT_DENSITY = 0.01  # surface points per cubic Angstrom
+rejected_sprawling = 0
 
 for label in unique_labels:
     if label == -1:
@@ -990,13 +1020,40 @@ for label in unique_labels:
     centroid = cp.mean(pocket_coords, axis=0)
     # The total pocket score is the sum of its point probabilities
     total_score = cp.sum(pocket_scores).item()
+    points_count = int(cp.sum(pocket_mask))
+
+    # --- True cavity volume via Convex Hull ---
+    # Pull the cluster's XYZ coordinates back to the CPU and wrap them in a convex
+    # hull. ConvexHull(...).volume returns the enclosed geometric volume of the
+    # pocket in cubic Angstroms. A ConvexHull needs at least 4 non-coplanar points;
+    # degenerate (flat/collinear) clusters raise QhullError and are treated as
+    # zero-volume so they can be filtered out.
+    pocket_coords_cpu = cp.asnumpy(pocket_coords)
+    try:
+        pocket_volume = float(ConvexHull(pocket_coords_cpu).volume)
+    except (QhullError, ValueError):
+        pocket_volume = 0.0
+
+    # Point density (compactness). Guard against division by zero for flat clusters.
+    point_density = points_count / pocket_volume if pocket_volume > 0.0 else 0.0
+
+    # Filter out sprawling, shallow clusters before they reach the export stage.
+    if pocket_volume <= 0.0 or point_density < MIN_POINT_DENSITY:
+        rejected_sprawling += 1
+        continue
 
     pockets.append({
         'id': int(label),
         'centroid': centroid.tolist(),
-        'points_count': int(cp.sum(pocket_mask)),
-        'rank_score': total_score
+        'points_count': points_count,
+        'rank_score': total_score,
+        'volume': pocket_volume,
+        'point_density': point_density
     })
+
+if rejected_sprawling > 0:
+    print(f"  -> Filtered out {rejected_sprawling} sprawling/shallow cluster(s) "
+          f"(volume <= 0 or density < {MIN_POINT_DENSITY} points/A^3)")
 
 # Sort pockets by their cumulative score in descending order (matching P2Rank logic)
 pockets = sorted(pockets, key=lambda k: k['rank_score'], reverse=True)
@@ -1011,6 +1068,8 @@ for rank, pocket in enumerate(pockets):
     print(f"RANK {rank + 1} (Internal Cluster ID: {pocket['id']})")
     print(f"  * Pocket Score: {pocket['rank_score']:.2f}")
     print(f"  * Density (Total Points): {pocket['points_count']} surface points")
+    print(f"  * Cavity Volume (Convex Hull): {pocket['volume']:.2f} A^3")
+    print(f"  * Point Density (compactness): {pocket['point_density']:.4f} points/A^3")
     print(f"  * Predicted Centroid (X, Y, Z): ({cx:.2f}, {cy:.2f}, {cz:.2f})")
     print("-" * 75)
 
@@ -1033,7 +1092,9 @@ for rank, pocket in enumerate(pockets):
         'center_x': round(cx, 3),
         'center_y': round(cy, 3),
         'center_z': round(cz, 3),
-        'sas_points': pocket['points_count']
+        'sas_points': pocket['points_count'],
+        'volume': round(pocket['volume'], 3),  # enclosed cavity volume in cubic Angstroms
+        'point_density': round(pocket['point_density'], 4)
     })
 
 # Export to JSON
