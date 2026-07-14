@@ -2,6 +2,9 @@
 
 An end-to-end, **GPU-native machine learning pipeline** for detecting, featurizing, and ranking druggable ligand-binding pockets on protein surfaces. It is a modern, highly parallelized reimplementation of the ideas behind the classical template-free predictor **[P2Rank](https://github.com/rdk/p2rank)**, rebuilt from the ground up so that the mathematically intensive spatial work runs **natively on an NVIDIA GPU** via CuPy, cuML, and hand-written C++/CUDA kernels.
 
+<img width="690" height="505" alt="image" src="https://github.com/user-attachments/assets/ac49024e-4e8c-4f65-b6d0-9f84535d0cce" />
+
+
 The whole workflow lives in the Jupyter/Colab notebook `XGBoost_GPU_(3)_(4).ipynb` (with `XGBoost_GPU_(3)_(4) (2).ipynb` as a working copy). This README explains the notebook cell by cell: what each stage does, why it is written the way it is, how it maps onto P2Rank, and how the same design scales up to millions of proteins by keeping data resident in GPU VRAM.
 
 > ⚠️ **Proof-of-concept notice.** In its current form the model is trained on a *randomly generated* target vector (`Y_train_gpu = cp.random.choice([0, 1], ...)`). The featurization, geometry, spatial hashing, and GPU plumbing are real and production-grade, but the *learned weights are not yet biophysically meaningful*. See [Limitations & Path to a Real Model](#-limitations--path-to-a-production-ready-model) for how to replace the mock target with real fragment-screening ground truth.
