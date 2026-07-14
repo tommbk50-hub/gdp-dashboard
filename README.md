@@ -4,6 +4,9 @@ An end-to-end, **GPU-native machine learning pipeline** for detecting, featurizi
 
 <img width="690" height="505" alt="image" src="https://github.com/user-attachments/assets/ac49024e-4e8c-4f65-b6d0-9f84535d0cce" />
 
+<img width="636" height="557" alt="image" src="https://github.com/user-attachments/assets/a2e93575-5eda-42b0-8d88-5761ed4a59f1" />
+
+
 
 The whole workflow lives in the Jupyter/Colab notebook `XGBoost_GPU_(3)_(4).ipynb` (with `XGBoost_GPU_(3)_(4) (2).ipynb` as a working copy). This README explains the notebook cell by cell: what each stage does, why it is written the way it is, how it maps onto P2Rank, and how the same design scales up to millions of proteins by keeping data resident in GPU VRAM.
 
